@@ -1,0 +1,52 @@
+syntax = "proto3";
+
+package chat.v1;
+
+option go_package = "chat_service/api/chat/v1;v1";
+
+service Chat {
+  rpc CreateChatCompletion(CreateChatCompletionRequest)
+      returns (CreateChatCompletionReply);
+}
+
+// 一条内部聊天消息。
+message ChatMessage {
+  string role = 1;
+  string content = 2;
+}
+
+// Gateway 调用 Chat Service 的请求。
+message CreateChatCompletionRequest {
+  string model = 1;
+  repeated ChatMessage messages = 2;
+}
+
+// 模型生成后的消息。
+message ChatCompletionMessage {
+  string role = 1;
+  string content = 2;
+}
+
+// 候选回答。
+message ChatCompletionChoice {
+  int32 index = 1;
+  ChatCompletionMessage message = 2;
+  string finish_reason = 3;
+}
+
+// token 使用量。
+message ChatCompletionUsage {
+  int32 prompt_tokens = 1;
+  int32 completion_tokens = 2;
+  int32 total_tokens = 3;
+}
+
+// Chat Service 返回给 Gateway 的响应。
+message CreateChatCompletionReply {
+  string id = 1;
+  string object = 2;
+  int64 created = 3;
+  string model = 4;
+  repeated ChatCompletionChoice choices = 5;
+  ChatCompletionUsage usage = 6;
+}

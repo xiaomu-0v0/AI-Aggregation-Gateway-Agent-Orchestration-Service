@@ -1,0 +1,12 @@
+# 统一以 LF 存入仓库，避免 Windows / macOS 协作时出现「整个文件都被修改」的 diff 噪音
+* text=auto eol=lf
+
+# 二进制文件不做行尾转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.gz binary
