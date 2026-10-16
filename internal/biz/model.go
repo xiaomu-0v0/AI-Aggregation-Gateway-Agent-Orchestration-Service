@@ -23,7 +23,7 @@ type ModelResult struct {
 type ModelProvider interface {
 	Generate(
 		ctx context.Context,
-		modele string,
+		model string,
 		message []Message,
 	) (*ModelResult, error)
 }

@@ -113,7 +113,7 @@ func (p *QwenProvider) Generate(ctx context.Context, model string, message []biz
 		return nil, fmt.Errorf("create qwen request: %w", err)
 	}
 
-	req.Header.Set("Authorization", "Bearer"+p.apiKey)
+	req.Header.Set("Authorization", "Bearer "+p.apiKey)
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := p.client.Do(req)
