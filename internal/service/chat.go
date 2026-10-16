@@ -2,61 +2,58 @@ package service
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	chatv1 "chat_service/api/chat/v1"
+	"chat_service/internal/biz"
 )
 
 // ChatService 实现内部的 Chat gRPC 服务。
 type ChatService struct {
 	chatv1.UnimplementedChatServer
+	uc *biz.ChatUsecase
 }
 
 // NewChatService 是 Wire 使用的构造函数。
-func NewChatService() *ChatService {
-	return &ChatService{}
+func NewChatService(uc *biz.ChatUsecase) *ChatService {
+	return &ChatService{uc: uc}
 }
 
-// CreateChatCompletion 暂时返回模拟的 AI 回复。
+// CreateChatCompletion 调用业务层完成对话生成，并转换为内部 Proto 回复。
 func (s *ChatService) CreateChatCompletion(ctx context.Context, in *chatv1.CreateChatCompletionRequest) (*chatv1.CreateChatCompletionReply, error) {
-	// 即使是模拟业务，也尊重请求的取消信号。
-	if err := ctx.Err(); err != nil {
+	messages := make([]biz.Message, 0, len(in.Messages))
+
+	for _, msg := range in.Messages {
+		messages = append(messages, biz.Message{
+			Role:    msg.Role,
+			Content: msg.Content,
+		})
+	}
+
+	result, err := s.uc.Complete(ctx, in.Model, messages)
+	if err != nil {
 		return nil, err
 	}
 
-	// 找到最后一条用户消息。
-	var userMessage string
-	for i := len(in.Messages) - 1; i >= 0; i-- {
-		if in.Messages[i].Role == "user" {
-			userMessage = in.Messages[i].Content
-			break
-		}
-	}
-
-	answer := fmt.Sprintf("模拟 AI 回复：我收到了你的问题：%s", userMessage)
-
-	now := time.Now()
-
 	return &chatv1.CreateChatCompletionReply{
-		Id:      fmt.Sprintf("chatcmpl-%d", now.UnixNano()),
+		Id:      result.ID,
 		Object:  "chat.completion",
-		Created: now.Unix(),
+		Created: time.Now().Unix(),
 		Model:   in.Model,
 		Choices: []*chatv1.ChatCompletionChoice{
 			{
 				Index: 0,
 				Message: &chatv1.ChatCompletionMessage{
 					Role:    "assistant",
-					Content: answer,
+					Content: result.Content,
 				},
-				FinishReason: "stop",
+				FinishReason: result.FinishReason,
 			},
 		},
 		Usage: &chatv1.ChatCompletionUsage{
-			PromptTokens:     0,
-			CompletionTokens: 0,
-			TotalTokens:      0,
+			PromptTokens:     result.PromptTokens,
+			CompletionTokens: result.CompletionTokens,
+			TotalTokens:      result.TotalTokens,
 		},
 	}, nil
 }

@@ -1,6 +1,7 @@
 package data
 
 import (
+	"chat_service/internal/biz"
 	"chat_service/internal/conf"
 
 	"github.com/go-kratos/kratos/v2/log"
@@ -8,7 +9,12 @@ import (
 )
 
 // ProviderSet is data providers.
-var ProviderSet = wire.NewSet(NewData, NewGreeterRepo)
+var ProviderSet = wire.NewSet(
+	NewData,
+	NewGreeterRepo,
+	NewQwenProvider,
+	wire.Bind(new(biz.ModelProvider), new(*QwenProvider)),
+)
 
 // Data .
 type Data struct {

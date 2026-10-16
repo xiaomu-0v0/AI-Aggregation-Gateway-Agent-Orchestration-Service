@@ -32,7 +32,13 @@ func wireApp(confServer *conf.Server, confData *conf.Data, logger log.Logger) (*
 	greeterRepo := data.NewGreeterRepo(dataData, logger)
 	greeterUsecase := biz.NewGreeterUsecase(greeterRepo, logger)
 	greeterService := service.NewGreeterService(greeterUsecase)
-	chatService := service.NewChatService()
+	qwenProvider, err := data.NewQwenProvider()
+	if err != nil {
+		cleanup()
+		return nil, nil, err
+	}
+	chatUsecase := biz.NewChatUsecase(qwenProvider)
+	chatService := service.NewChatService(chatUsecase)
 	grpcServer := server.NewGRPCServer(confServer, greeterService, chatService, logger)
 	httpServer := server.NewHTTPServer(confServer, greeterService, logger)
 	consulRegistry, err := registry.NewConsulRegistry()

@@ -4,8 +4,8 @@
 
 对外提供 **OpenAI 兼容**的 HTTP 对话接口，对内通过 gRPC + Consul 组网，支持同机多实例水平扩展。
 
-> **当前进度**：对话接口骨架（非流式）已打通，参数校验、错误映射、服务发现、熔断与重试均已就位。
-> 下游模型调用目前是**模拟实现**，尚未接入真实大模型，`usage` 中的 token 用量为占位值。
+> **当前进度**：非流式对话链路已全链路打通，并已接入**通义千问（DashScope）**真实模型，
+> `usage` 中的 token 用量来自模型返回的真实统计。SSE 流式响应尚未实现。
 
 ---
 
@@ -32,8 +32,16 @@
                                             │   Chat / Greeter 服务  │
                                             └───────────┬───────────┘
                                                         │
+                                            biz.ModelProvider 接口
+                                                        │
                                                         ▼
-                                              模拟回复（待接入模型）
+                                            ┌───────────────────────┐
+                                            │    data.QwenProvider  │
+                                            │  通义千问 OpenAI 兼容  │
+                                            └───────────┬───────────┘
+                                                        │ HTTPS
+                                                        ▼
+                                              DashScope  百炼平台
 
                   ┌──────────────────────────────────────────────┐
                   │   Consul  127.0.0.1:8500   服务注册与发现      │
@@ -45,6 +53,8 @@
 | 关注点 | 实现方式 |
 | --- | --- |
 | 内外协议隔离 | 对外是手写的 OpenAI 兼容 JSON，对内是 protobuf gRPC，二者在 gateway 显式转换 |
+| 模型抽象 | `biz.ModelProvider` 接口定义业务层需要的模型能力，`data.QwenProvider` 提供实现，由 Wire 绑定；业务层不依赖任何厂商 SDK，换模型只改 `data` 层 |
+| 逻辑模型名 | 对外统一暴露 `chat-default`，由 `QWEN_MODEL` 决定背后真实调用的模型，为后续多厂商路由留出扩展位 |
 | 服务发现 | Consul；gateway 通过 `discovery:///chat_service` 解析下游实例 |
 | 容错 | 客户端熔断（`circuitbreaker`）+ 对 `Unavailable` 的退避重试（最多 3 次，熔断打开时不再重试） |
 | 可观测 | 统一日志中间件、`request_id` 透传、metadata 跨进程传递 |
@@ -66,9 +76,12 @@
 ├── configs-instance-2/       # 第二实例配置（多实例演示）
 ├── docs/api/                 # 接口对接文档
 ├── internal/
-│   ├── biz/                  # 业务逻辑
+│   ├── biz/                  # 业务用例与模型抽象
+│   │   ├── model.go          #   ModelProvider 接口 + ChatUsecase
+│   │   └── greeter.go        #   Greeter 用例
 │   ├── conf/                 # 配置结构（protobuf 定义）
-│   ├── data/                 # 数据访问
+│   ├── data/                 # 数据访问与模型实现
+│   │   └── qwen.go           #   通义千问 Provider（DashScope HTTP 调用）
 │   ├── gateway/              # 网关专属：client / middleware / server / service
 │   ├── middleware/           # 通用日志中间件
 │   ├── registry/             # Consul 注册中心接入
@@ -88,6 +101,7 @@
 
 - Go 1.22+
 - Consul（默认 `127.0.0.1:8500`）
+- 阿里云百炼（DashScope）API Key
 - MySQL / Redis（配置已预留，当前业务尚未实际使用）
 - `protoc` 及 Kratos 插件（仅在改动 proto 时需要）
 
@@ -103,31 +117,60 @@ make init
 consul agent -dev
 ```
 
-### 3. 启动内网服务
+### 3. 配置模型访问凭证
+
+`chat_service` 启动时从**环境变量**读取模型配置。必填项缺失会直接启动失败（`panic`），这是刻意设计——避免带着空凭证跑起来、到线上才暴露。
+
+| 环境变量 | 必填 | 说明 |
+| --- | --- | --- |
+| `DASHSCOPE_API_KEY` | 是 | 阿里云百炼 API Key |
+| `QWEN_BASE_URL` | 是 | DashScope OpenAI 兼容模式地址 |
+| `QWEN_MODEL` | 否 | 实际调用的模型，默认 `qwen-plus` |
+| `INSTANCE_NAME` | 否 | 实例标识，多实例时用于区分响应来源，默认 `chat-unknow` |
+
+PowerShell：
+
+```powershell
+$env:DASHSCOPE_API_KEY = "sk-你的key"
+$env:QWEN_BASE_URL     = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+$env:QWEN_MODEL        = "qwen-plus"
+```
+
+Bash：
+
+```bash
+export DASHSCOPE_API_KEY="sk-你的key"
+export QWEN_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1"
+export QWEN_MODEL="qwen-plus"
+```
+
+> **不要把密钥写进任何会提交到仓库的文件。** `.gitignore` 已忽略 `.env` 与 `configs/*.local.yaml`，需要固化凭证时请使用这两者之一。代码中**没有任何硬编码密钥**。
+
+### 4. 启动内网服务
 
 ```bash
 go run ./cmd/chat_service -conf ./configs
 ```
 
-### 4. 启动对外网关
+### 5. 启动对外网关
 
 ```bash
 go run ./cmd/gateway
 ```
 
-### 5. 发起调用
+### 6. 发起调用
 
 ```bash
 curl -X POST http://127.0.0.1:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"chat-default","messages":[{"role":"user","content":"你好"}],"stream":false}'
+  -d '{"model":"chat-default","messages":[{"role":"user","content":"你好，请用一句话介绍 Go"}],"stream":false}'
 ```
 
 预期返回：
 
 ```json
 {
-  "id": "chatcmpl-1730000000000000000",
+  "id": "chatcmpl-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
   "object": "chat.completion",
   "created": 1730000000,
   "model": "chat-default",
@@ -136,24 +179,26 @@ curl -X POST http://127.0.0.1:8080/v1/chat/completions \
       "index": 0,
       "message": {
         "role": "assistant",
-        "content": "模拟 AI 回复：我收到了你的问题：你好"
+        "content": "Go 是 Google 开发的静态强类型、自带并发与垃圾回收的编译型语言。"
       },
       "finish_reason": "stop"
     }
   ],
-  "usage": { "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0 }
+  "usage": { "prompt_tokens": 18, "completion_tokens": 26, "total_tokens": 44 }
 }
 ```
 
-> 当前为模拟回复，`usage` 是占位值，不代表真实用量。
+> `id` 与 `usage` 均来自模型返回的真实数据。
+> 响应中的 `model` 字段回显的是**请求里的逻辑模型名**（`chat-default`），不是上游真实模型名；后者目前未对外暴露。
 
-### 6. 运行多实例（可选）
+### 7. 运行多实例（可选）
 
 ```bash
-go run ./cmd/chat_service -conf ./configs-instance-2
+INSTANCE_NAME=chat-a go run ./cmd/chat_service -conf ./configs
+INSTANCE_NAME=chat-b go run ./cmd/chat_service -conf ./configs-instance-2
 ```
 
-Consul 中会出现两个 `chat_service` 实例，gateway 会在它们之间分发请求。
+Consul 中会出现两个 `chat_service` 实例，gateway 会在它们之间分发请求。调用 Greeter 接口时，响应里的 `from chat-a` / `from chat-b` 可以看出本次命中了哪个实例。
 
 ---
 
@@ -172,9 +217,9 @@ Consul 中会出现两个 `chat_service` 实例，gateway 会在它们之间分�
 | HTTP | 场景 | `code` |
 | --- | --- | --- |
 | `400` | 请求体非法 / `model` 缺失 / `messages` 为空 / 角色不支持 / `stream=true` | `invalid_request`、`invalid_role`、`unsupported_value` |
-| `502` | 下游返回未知错误 | `upstream_error` |
-| `503` | 下游不可用或熔断已打开 | `service_unavailable` |
-| `504` | 下游调用超时（网关侧上限 15s） | `timeout` |
+| `502` | 下游模型返回异常响应 | `upstream_error` |
+| `503` | 模型服务不可用或熔断已打开 | `service_unavailable` |
+| `504` | 模型调用超时（网关侧上限 15s） | `timeout` |
 
 ---
 
@@ -189,16 +234,27 @@ Consul 中会出现两个 `chat_service` 实例，gateway 会在它们之间分�
 - [x] 下游异常到 HTTP 状态码的映射（502 / 503 / 504）
 - [x] 客户端熔断与退避重试
 - [x] 跨进程 metadata 与 `request_id` 透传
+- [x] **接入通义千问真实模型**，替换模拟回复
+- [x] **token 用量取自模型返回的真实统计**
+- [x] 模型能力抽象为 `biz.ModelProvider` 接口，业务层与厂商解耦
 
 **待办**
 
-- [ ] 接入真实大模型，替换 `internal/service/chat.go` 中的模拟回复
-- [ ] 以模型返回的真实 token 统计替换占位值
+- [ ] 多模型路由：按请求参数分发到不同厂商 / 模型，取代当前写死的 `chat-default` 判断
 - [ ] SSE 流式响应（当前 `stream=true` 返回明确的不支持错误）
-- [ ] 模型路由与多厂商适配（对应「AI 聚合网关」目标）
+- [ ] 模型调用重试与降级策略（当前仅 gRPC 层有重试）
 - [ ] Agent 编排能力
 - [ ] 数据库 / Redis 实际接入，配置外部化
 - [ ] 单元测试与 CI
+
+---
+
+## 已知限制
+
+- **逻辑模型名只有 `chat-default` 一个**，传入其他值会被 Provider 拒绝。
+- 不支持的模型名目前经过 gateway 的错误映射后返回 **`502 upstream_error`**，语义上更接近客户端参数错误（`400`），后续统一错误分类时修正。
+- 响应 `model` 字段回显请求值，未透出上游真实模型名。
+- 网关侧硬编码 15s 调用超时，Provider 侧 HTTP 客户端为 60s，二者尚未统一到配置。
 
 ---
 
@@ -220,8 +276,10 @@ Consul 中会出现两个 `chat_service` 实例，gateway 会在它们之间分�
 ```bash
 docker build -t ai-gateway .
 
-# 启动内网服务（默认）
+# 启动内网服务（默认），凭证通过 -e 注入
 docker run --rm -p 8000:8000 -p 9000:9000 \
+  -e DASHSCOPE_API_KEY="sk-你的key" \
+  -e QWEN_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1" \
   -v /path/to/configs:/data/conf ai-gateway
 
 # 启动对外网关
