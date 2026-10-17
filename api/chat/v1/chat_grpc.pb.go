@@ -20,6 +20,7 @@ const _ = grpc.SupportPackageIsVersion9
 
 const (
 	Chat_CreateChatCompletion_FullMethodName = "/chat.v1.Chat/CreateChatCompletion"
+	Chat_StreamChatCompletion_FullMethodName = "/chat.v1.Chat/StreamChatCompletion"
 )
 
 // ChatClient is the client API for Chat service.
@@ -27,6 +28,7 @@ const (
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type ChatClient interface {
 	CreateChatCompletion(ctx context.Context, in *CreateChatCompletionRequest, opts ...grpc.CallOption) (*CreateChatCompletionReply, error)
+	StreamChatCompletion(ctx context.Context, in *CreateChatCompletionRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ChatCompletionChunk], error)
 }
 
 type chatClient struct {
@@ -47,11 +49,31 @@ func (c *chatClient) CreateChatCompletion(ctx context.Context, in *CreateChatCom
 	return out, nil
 }
 
+func (c *chatClient) StreamChatCompletion(ctx context.Context, in *CreateChatCompletionRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ChatCompletionChunk], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &Chat_ServiceDesc.Streams[0], Chat_StreamChatCompletion_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[CreateChatCompletionRequest, ChatCompletionChunk]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Chat_StreamChatCompletionClient = grpc.ServerStreamingClient[ChatCompletionChunk]
+
 // ChatServer is the server API for Chat service.
 // All implementations must embed UnimplementedChatServer
 // for forward compatibility.
 type ChatServer interface {
 	CreateChatCompletion(context.Context, *CreateChatCompletionRequest) (*CreateChatCompletionReply, error)
+	StreamChatCompletion(*CreateChatCompletionRequest, grpc.ServerStreamingServer[ChatCompletionChunk]) error
 	mustEmbedUnimplementedChatServer()
 }
 
@@ -64,6 +86,9 @@ type UnimplementedChatServer struct{}
 
 func (UnimplementedChatServer) CreateChatCompletion(context.Context, *CreateChatCompletionRequest) (*CreateChatCompletionReply, error) {
 	return nil, status.Error(codes.Unimplemented, "method CreateChatCompletion not implemented")
+}
+func (UnimplementedChatServer) StreamChatCompletion(*CreateChatCompletionRequest, grpc.ServerStreamingServer[ChatCompletionChunk]) error {
+	return status.Error(codes.Unimplemented, "method StreamChatCompletion not implemented")
 }
 func (UnimplementedChatServer) mustEmbedUnimplementedChatServer() {}
 func (UnimplementedChatServer) testEmbeddedByValue()              {}
@@ -104,6 +129,17 @@ func _Chat_CreateChatCompletion_Handler(srv interface{}, ctx context.Context, de
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Chat_StreamChatCompletion_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(CreateChatCompletionRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(ChatServer).StreamChatCompletion(m, &grpc.GenericServerStream[CreateChatCompletionRequest, ChatCompletionChunk]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Chat_StreamChatCompletionServer = grpc.ServerStreamingServer[ChatCompletionChunk]
+
 // Chat_ServiceDesc is the grpc.ServiceDesc for Chat service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -116,6 +152,12 @@ var Chat_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _Chat_CreateChatCompletion_Handler,
 		},
 	},
-	Streams:  []grpc.StreamDesc{},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "StreamChatCompletion",
+			Handler:       _Chat_StreamChatCompletion_Handler,
+			ServerStreams: true,
+		},
+	},
 	Metadata: "chat/v1/chat.proto",
 }

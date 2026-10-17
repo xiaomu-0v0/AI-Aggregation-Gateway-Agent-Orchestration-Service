@@ -7,6 +7,8 @@ option go_package = "chat_service/api/chat/v1;v1";
 service Chat {
   rpc CreateChatCompletion(CreateChatCompletionRequest)
       returns (CreateChatCompletionReply);
+  rpc StreamChatCompletion(CreateChatCompletionRequest)
+    returns (stream ChatCompletionChunk);
 }
 
 // 一条内部聊天消息。
@@ -49,4 +51,11 @@ message CreateChatCompletionReply {
   string model = 4;
   repeated ChatCompletionChoice choices = 5;
   ChatCompletionUsage usage = 6;
+}
+
+message ChatCompletionChunk {
+  string id = 1;
+  string model = 2;
+  string content = 3;
+  string finish_reason = 4;
 }

@@ -6,6 +6,8 @@ import (
 
 	chatv1 "chat_service/api/chat/v1"
 	"chat_service/internal/biz"
+
+	"google.golang.org/grpc"
 )
 
 // ChatService 实现内部的 Chat gRPC 服务。
@@ -56,4 +58,31 @@ func (s *ChatService) CreateChatCompletion(ctx context.Context, in *chatv1.Creat
 			TotalTokens:      result.TotalTokens,
 		},
 	}, nil
+}
+
+func (s *ChatService) StreamChatCompletion(in *chatv1.CreateChatCompletionRequest, stream grpc.ServerStreamingServer[chatv1.ChatCompletionChunk]) error {
+	ctx := stream.Context()
+
+	messages := make([]biz.Message, 0, len(in.Messages))
+
+	for _, msg := range in.Messages {
+		messages = append(messages, biz.Message{
+			Role:    msg.Role,
+			Content: msg.Content,
+		})
+	}
+
+	return s.uc.Stream(
+		ctx,
+		in.GetModel(),
+		messages,
+		func(chunk *biz.ModelStreamChunk) error {
+			return stream.Send(&chatv1.ChatCompletionChunk{
+				Id:           chunk.ID,
+				Model:        chunk.Model,
+				Content:      chunk.Content,
+				FinishReason: chunk.FinishReason,
+			})
+		},
+	)
 }
