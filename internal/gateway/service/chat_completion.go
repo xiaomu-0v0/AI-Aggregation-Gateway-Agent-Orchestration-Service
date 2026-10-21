@@ -14,6 +14,7 @@ import (
 	gatewaymiddleware "chat_service/internal/gateway/middleware"
 
 	kerrors "github.com/go-kratos/kratos/v2/errors"
+	"github.com/go-kratos/kratos/v2/log"
 	kmetadata "github.com/go-kratos/kratos/v2/metadata"
 	khttp "github.com/go-kratos/kratos/v2/transport/http"
 	"google.golang.org/grpc/codes"
@@ -382,10 +383,19 @@ func (s *ChatCompletionService) handleStream(ctx khttp.Context, grpcReq *chatv1.
 		}
 
 		if err != nil {
-			// 用户主动断开时，不必再向已经断开的连接写入错误。
+			// 用户主动断开时，不必再向已经断开的连接写入错误，也不必记错误日志。
 			if ctx.Request().Context().Err() != nil {
 				return nil
 			}
+
+			// HTTP 200 已经发出，不能再改成 502/504。
+			// 用日志保留现场，再用 SSE 事件把错误告知调用方。
+			log.Errorf(
+				"chat stream interrupted: request_id=%s model=%s err=%v",
+				requestID(ctx.Request().Context()),
+				grpcReq.GetModel(),
+				err,
+			)
 
 			switch {
 			case errors.Is(err, context.DeadlineExceeded),

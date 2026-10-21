@@ -335,8 +335,8 @@ Consul 中会出现两个 `chat_service` 实例，gateway 会在它们之间分�
 - 不支持的模型名目前经过 gateway 的错误映射后返回 **`502 upstream_error`**，语义上更接近客户端参数错误（`400`），后续统一错误分类时修正。
 - 响应 `model` 字段回显请求值，未透出上游真实模型名。
 - 流式的 `include_usage` 只控制是否下发用量帧；Provider 对上游始终请求用量。
-- `configs-instance-2/config.yaml` 的 `server.grpc.timeout` 仍为 `1s`，第二实例跑慢请求会被截断，需与主实例对齐。
-- 流式中途出错后不再写日志，`requestID` 辅助函数当前未被调用。
+- `/v1/chat/completions` 是手工注册的路由，**未经过 Kratos 中间件链**（`metamw` / `RequestID` / `recovery`）。
+  因此流式错误日志中的 `request_id` 恒为空，该路由也没有 panic 恢复中间件。
 
 ---
 

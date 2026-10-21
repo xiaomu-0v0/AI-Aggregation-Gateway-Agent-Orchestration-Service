@@ -274,5 +274,3 @@ data: {"error":{"message":"chat stream timed out","type":"server_error","param":
 - 逻辑模型名只有 `chat-default` 一个，传入其他值会被拒绝。
 - 不支持的模型名返回 `502 upstream_error` 而非 `400`，错误分类待统一。
 - 响应 `model` 字段回显请求值，未透出上游真实模型名。
-- 流式中途出错后不再记录服务端日志，排查生产问题时只能依赖客户端上报的错误事件。
-- `configs-instance-2/config.yaml` 的 gRPC 超时仍为 `1s`，第二实例跑慢请求会被截断。
