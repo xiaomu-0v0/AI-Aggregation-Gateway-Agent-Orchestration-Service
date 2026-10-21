@@ -39,9 +39,7 @@ func NewQwenProvider() (*QwenProvider, error) {
 	}
 
 	return &QwenProvider{
-		client: &http.Client{
-			Timeout: 60 * time.Second,
-		},
+		client:  &http.Client{},
 		apiKey:  apiKey,
 		baseURL: baseURL,
 		model:   model,
@@ -105,6 +103,9 @@ func (p *QwenProvider) Generate(ctx context.Context, model string, message []biz
 	if model != "chat-default" {
 		return nil, fmt.Errorf("unsupported model: %s", model)
 	}
+
+	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
 
 	reqBody := qwenRequest{
 		Model:  p.model,
@@ -181,6 +182,9 @@ func (p *QwenProvider) StreamGenerate(ctx context.Context, model string, message
 	if model != "chat-default" {
 		return fmt.Errorf("unsupported model: %s", model)
 	}
+
+	ctx, cancel := context.WithTimeout(ctx, 4*time.Minute+30*time.Second)
+	defer cancel()
 
 	// 1.构造流式请求
 	reqBody := qwenRequest{
@@ -301,15 +305,32 @@ func (p *QwenProvider) StreamGenerate(ctx context.Context, model string, message
 				return err
 			}
 		}
+
+		// 用量可能出现在 choices 为空的数据块中。
+		if chunk.Usage != nil {
+			err := emit(&biz.ModelStreamChunk{
+				ID:    chunk.ID,
+				Model: chunk.Model,
+				Usage: &biz.ModelUsage{
+					PromptTokens:     chunk.Usage.PromptTokens,
+					CompletionTokens: chunk.Usage.CompletionTokens,
+					TotalTokens:      chunk.Usage.TotalTokens,
+				},
+			})
+			if err != nil {
+				return err
+			}
+		}
 	}
 
 	// 5. 区分正常结束、读取错误和异常中断。
-	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("read qwen stream: %w", err)
-	}
 
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("read qwen stream: %w", err)
 	}
 
 	if !receiveDone {

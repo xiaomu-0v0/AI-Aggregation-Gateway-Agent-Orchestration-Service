@@ -14,7 +14,6 @@ import (
 	gatewaymiddleware "chat_service/internal/gateway/middleware"
 
 	kerrors "github.com/go-kratos/kratos/v2/errors"
-	"github.com/go-kratos/kratos/v2/log"
 	kmetadata "github.com/go-kratos/kratos/v2/metadata"
 	khttp "github.com/go-kratos/kratos/v2/transport/http"
 	"google.golang.org/grpc/codes"
@@ -34,9 +33,10 @@ func NewChatCompletionService(client chatv1.ChatClient) *ChatCompletionService {
 
 // HTTP 请求结构：这是外部 API 的契约，不是内部 Proto 类型。
 type ChatCompletionRequest struct {
-	Model    string       `json:"model"`
-	Messages []APIMessage `json:"messages"`
-	Stream   bool         `json:"stream"`
+	Model         string            `json:"model"`
+	Messages      []APIMessage      `json:"messages"`
+	Stream        bool              `json:"stream"`
+	StreamOptions *APIStreamOptions `json:"stream_options,omitempty"`
 }
 
 type APIMessage struct {
@@ -65,6 +65,10 @@ type APIUsage struct {
 	TotalTokens      int32 `json:"total_tokens"`
 }
 
+type APIStreamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
+}
+
 type APIErrorResponse struct {
 	Error APIErrorDetail `json:"error"`
 }
@@ -82,6 +86,7 @@ type SSEChatCompletionChunk struct {
 	Created int64       `json:"created"`
 	Model   string      `json:"model"`
 	Choices []SSEChoice `json:"choices"`
+	Usage   *APIUsage   `json:"usage,omitempty"`
 }
 
 type SSEChoice struct {
@@ -134,7 +139,8 @@ func (s *ChatCompletionService) Handler(ctx khttp.Context) error {
 
 	// 校验消息角色，并转换为内部 Proto 请求。
 	grpcReq := &chatv1.CreateChatCompletionRequest{
-		Model: req.Model,
+		Model:        req.Model,
+		IncludeUsage: req.StreamOptions != nil && req.StreamOptions.IncludeUsage,
 	}
 
 	for i, message := range req.Messages {
@@ -177,8 +183,8 @@ func (s *ChatCompletionService) Handler(ctx khttp.Context) error {
 		return s.handleStream(ctx, grpcReq)
 	}
 
-	// 本次先设置 15 秒总调用时限。
-	rpcCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	// 普通请求总时限，略大于 Provider 和内部 gRPC 服务的时限。
+	rpcCtx, cancel := context.WithTimeout(ctx.Request().Context(), 70*time.Second)
 	defer cancel()
 
 	reply, err := s.client.CreateChatCompletion(rpcCtx, grpcReq)
@@ -280,7 +286,7 @@ func requestID(ctx context.Context) string {
 
 func (s *ChatCompletionService) handleStream(ctx khttp.Context, grpcReq *chatv1.CreateChatCompletionRequest) error {
 	// 总调用时限。HTTP 请求取消时，这个 Context 也会被取消。
-	rpcCtx, cancel := context.WithTimeout(ctx.Request().Context(), 60*time.Second)
+	rpcCtx, cancel := context.WithTimeout(ctx.Request().Context(), 5*time.Minute)
 	defer cancel()
 
 	// 1. 创建 gRPC 流。
@@ -354,24 +360,70 @@ func (s *ChatCompletionService) handleStream(ctx khttp.Context, grpcReq *chatv1.
 			break
 		}
 
-		if err != nil {
-			// HTTP 200 已经发出，不能再改成 502/504。
-			// 使用 SSE 事件表达流中途发生的错误。
-			log.Errorf(
-				"chat stream interrupted: request_id=%s model=%s err=%v",
-				requestID(ctx.Request().Context()),
-				grpcReq.GetModel(),
-				err,
-			)
-
-			_ = writeSSE(w, flusher, map[string]interface{}{
-				"error": APIErrorDetail{
-					Message: "chat stream interrupted",
-					Type:    "server_error",
-					Param:   "",
-					Code:    "stream_interrupted",
+		if chunk.GetUsage() != nil {
+			event := SSEChatCompletionChunk{
+				ID:      completionID,
+				Object:  "chat.completion.chunk",
+				Created: created,
+				Model:   grpcReq.GetModel(),
+				Choices: []SSEChoice{},
+				Usage: &APIUsage{
+					PromptTokens:     chunk.GetUsage().GetPromptTokens(),
+					CompletionTokens: chunk.GetUsage().GetCompletionTokens(),
+					TotalTokens:      chunk.GetUsage().GetTotalTokens(),
 				},
-			})
+			}
+
+			if err := writeSSE(w, flusher, event); err != nil {
+				return nil
+			}
+
+			continue
+		}
+
+		if err != nil {
+			// 用户主动断开时，不必再向已经断开的连接写入错误。
+			if ctx.Request().Context().Err() != nil {
+				return nil
+			}
+
+			switch {
+			case errors.Is(err, context.DeadlineExceeded),
+				status.Code(err) == codes.DeadlineExceeded:
+
+				_ = writeSSE(w, flusher, map[string]interface{}{
+					"error": APIErrorDetail{
+						Message: "chat stream timed out",
+						Type:    "server_error",
+						Param:   "",
+						Code:    "timeout",
+					},
+				})
+
+			case status.Code(err) == codes.Unavailable,
+				kerrors.Reason(err) == "CIRCUITBREAKER":
+
+				_ = writeSSE(w, flusher, map[string]interface{}{
+					"error": APIErrorDetail{
+						Message: "chat service temporarily unavailable",
+						Type:    "server_error",
+						Param:   "",
+						Code:    "service_unavailable",
+					},
+				})
+
+			default:
+				_ = writeSSE(w, flusher, map[string]interface{}{
+					"error": APIErrorDetail{
+						Message: "chat stream interrupted",
+						Type:    "server_error",
+						Param:   "",
+						Code:    "upstream_error",
+					},
+				})
+			}
+
+			// 流已经异常结束，不要再发送正常的 [DONE]。
 			return nil
 		}
 

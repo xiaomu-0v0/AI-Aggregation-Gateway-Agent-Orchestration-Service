@@ -22,12 +22,20 @@ type ModelResult struct {
 	TotalTokens      int32
 }
 
+// ModelUsage 是模型使用情况。
+type ModelUsage struct {
+	PromptTokens     int32
+	CompletionTokens int32
+	TotalTokens      int32
+}
+
 // ModelStreamChunk 表示模型流式生成的一小段内容。
 type ModelStreamChunk struct {
 	ID           string
 	Model        string
 	Content      string
 	FinishReason string
+	Usage        *ModelUsage
 }
 
 // ModelProvider 是业务层需要的模型能力。

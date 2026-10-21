@@ -4,7 +4,9 @@ server:
     timeout: 1s
   grpc:
     addr: 127.0.0.1:9000
-    timeout: 1s
+    # 普通请求：Provider 60s < gRPC Server 65s < Gateway 70s。
+    # Kratos 的这个选项仅作用于 unary RPC；流式调用由请求 Context 控制。
+    timeout: 65s
 data:
   database:
     driver: mysql

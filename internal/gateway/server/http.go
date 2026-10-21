@@ -21,6 +21,8 @@ func NewHTTPServer(greeter *service.GreeterService, chatCompletion *service.Chat
 
 	srv := khttp.NewServer(
 		khttp.Address(":8080"),
+		// Chat Handler 分别控制普通请求和流式请求的时限，关闭默认的 1 秒限制。
+		khttp.Timeout(0),
 		khttp.Middleware(
 			middleware_log.Logger(logger),
 			metamw.Server(),

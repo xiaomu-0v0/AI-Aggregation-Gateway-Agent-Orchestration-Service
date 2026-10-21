@@ -21,6 +21,7 @@ message ChatMessage {
 message CreateChatCompletionRequest {
   string model = 1;
   repeated ChatMessage messages = 2;
+  bool include_usage = 3;
 }
 
 // 模型生成后的消息。
@@ -58,4 +59,5 @@ message ChatCompletionChunk {
   string model = 2;
   string content = 3;
   string finish_reason = 4;
+  ChatCompletionUsage usage = 5;
 }

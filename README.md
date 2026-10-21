@@ -5,7 +5,8 @@
 对外提供 **OpenAI 兼容**的 HTTP 对话接口，对内通过 gRPC + Consul 组网，支持同机多实例水平扩展。
 
 > **当前进度**：非流式与 **SSE 流式**对话链路均已打通，并已接入**通义千问（DashScope）**真实模型。
-> 非流式响应的 `usage` 来自模型返回的真实统计；流式响应的 token 用量尚未透出，详见「已知限制」。
+> 两种模式都能返回真实 token 用量（流式需客户端显式开启 `stream_options.include_usage`）。
+> 超时链路已按「内层短、外层长」逐层收敛。
 
 ---
 
@@ -20,10 +21,11 @@
                                             │        gateway        │
                                             │   对外 HTTP  :8080     │
                                             │  OpenAI 兼容 JSON 契约 │
+                                            │    服务端超时已关闭    │
                                             └───────────┬───────────┘
                                                         │ gRPC
                                     服务发现 discovery:///chat_service
-                                    熔断 · 元数据透传 · 超时控制
+                                    熔断 · 元数据透传 · 逐层超时
                                      一元调用 / 服务端流式调用
                                                         │
                                                         ▼
@@ -58,11 +60,27 @@
 | 模型抽象 | `biz.ModelProvider` 接口定义业务层需要的模型能力，`data.QwenProvider` 提供实现，由 Wire 绑定；业务层不依赖任何厂商 SDK，换模型只改 `data` 层 |
 | 流式能力 | `biz.StreamingModelProvider` 作为**可选接口**独立存在，`ChatUsecase.Stream` 通过类型断言按需启用；未实现该接口的 Provider 会明确报错而非静默降级，主接口保持干净 |
 | 流式透传 | gateway 先用 gRPC 服务端流接收内部 chunk，再逐帧转成 OpenAI 风格 SSE 并 `Flush`，中间不攒批，保证首字延迟 |
+| 逐层超时 | 内层短、外层长，避免外层先超时后内层仍在消耗模型配额；网关关掉 Kratos 默认的 1s 服务端超时，改由 Handler 按模式分别控制 |
 | 逻辑模型名 | 对外统一暴露 `chat-default`，由 `QWEN_MODEL` 决定背后真实调用的模型，为后续多厂商路由留出扩展位 |
 | 服务发现 | Consul；gateway 通过 `discovery:///chat_service` 解析下游实例 |
 | 容错 | 客户端熔断（`circuitbreaker`）+ 对 `Unavailable` 的退避重试（最多 3 次，熔断打开时不再重试） |
 | 可观测 | 统一日志中间件、`request_id` 透传、metadata 跨进程传递 |
 | 多实例 | `chat_service` 以「主机名 + gRPC 端口」作为 Consul 实例 ID，同一台机器可跑多实例 |
+
+### 超时链路
+
+Kratos 的 `transport/grpc` 中 `timeout` **只作用于一元（unary）调用**，流式调用不受该选项约束，
+因此两种模式需要分别设计：
+
+| 层级 | 非流式 | 流式 | 说明 |
+| --- | --- | --- | --- |
+| Provider HTTP 调用 | 60s | 270s | `context.WithTimeout` 控制；`http.Client` 本身不设超时，避免与上下文冲突 |
+| gRPC Server（chat_service） | 65s | 不生效 | `configs/config.yaml` 的 `server.grpc.timeout` |
+| gRPC Client（gateway） | 70s | 不生效 | `kgrpc.WithTimeout`，仅由一元拦截器使用 |
+| Gateway Handler | 70s | 300s | 两种模式各自的 `context.WithTimeout` |
+| Gateway HTTP Server | 无 | 无 | `khttp.Timeout(0)` 关闭默认 1s 限制 |
+
+> 关键点：内层必须短于外层，否则外层先返回超时、内层却还在消耗模型配额。
 
 ---
 
@@ -89,7 +107,7 @@
 │   ├── gateway/              # 网关专属：client / middleware / server / service
 │   ├── middleware/           # 通用日志中间件
 │   ├── registry/             # Consul 注册中心接入
-│   ├── server/               # HTTP / gRPC server 装配
+│   ├── server/               # HTTP / gRPC server 装配（含端到端集成测试）
 │   └── service/              # 业务服务实现
 ├── third_party/              # protoc 依赖的公共 proto
 ├── Dockerfile
@@ -197,12 +215,17 @@ curl -X POST http://127.0.0.1:8080/v1/chat/completions \
 
 ### 7. 发起流式调用
 
-把 `stream` 改为 `true`，并用 `-N` 关闭 curl 的缓冲，才能看到逐字输出：
+把 `stream` 改为 `true`，并用 `-N` 关闭 curl 的缓冲，才能看到逐字输出。若要一并拿到 token 用量，加上 `stream_options.include_usage`：
 
 ```bash
 curl -N -X POST http://127.0.0.1:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"chat-default","messages":[{"role":"user","content":"你好，请用一句话介绍 Go"}],"stream":true}'
+  -d '{
+    "model":"chat-default",
+    "messages":[{"role":"user","content":"你好，请用一句话介绍 Go"}],
+    "stream":true,
+    "stream_options":{"include_usage":true}
+  }'
 ```
 
 预期输出（每帧之间是空行分隔）：
@@ -218,10 +241,12 @@ data: {"id":"chatcmpl-1730000000000000000","object":"chat.completion.chunk","cre
 
 data: {"id":"chatcmpl-1730000000000000000","object":"chat.completion.chunk","created":1730000000,"model":"chat-default","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
 
+data: {"id":"chatcmpl-1730000000000000000","object":"chat.completion.chunk","created":1730000000,"model":"chat-default","choices":[],"usage":{"prompt_tokens":18,"completion_tokens":26,"total_tokens":44}}
+
 data: [DONE]
 ```
 
-> 流式响应目前**不包含 `usage`**，token 用量透出待后续实现。
+> 用量帧的特征是 `choices` 为空数组。不传 `stream_options.include_usage` 时不会出现该帧。
 
 ### 8. 运行多实例（可选）
 
@@ -248,15 +273,16 @@ Consul 中会出现两个 `chat_service` 实例，gateway 会在它们之间分�
 
 | `stream` | 响应类型 | 说明 |
 | --- | --- | --- |
-| `false`（默认） | `application/json` | 一次性返回完整结果，网关侧时限 15s |
-| `true` | `text/event-stream` | 按块推送增量内容，以 `data: [DONE]` 结束，网关侧时限 60s |
+| `false`（默认） | `application/json` | 一次性返回完整结果，处理时限 70s |
+| `true` | `text/event-stream` | 按块推送增量内容，以 `data: [DONE]` 结束，处理时限 300s |
 
 流式响应遵循 OpenAI 的 SSE 约定：
 
 - `object` 为 `chat.completion.chunk`，同一流的 `id` 与 `created` 保持一致
 - 首帧只带 `delta.role = "assistant"`，之后逐帧推送 `delta.content`
-- 最后一帧带 `finish_reason`（如 `stop`），随后发送 `data: [DONE]`
-- 响应头已发出（HTTP 200）后若流中断，改用 `data: {"error":{...}}` 事件通知，`code` 为 `stream_interrupted`
+- 终止帧带 `finish_reason`（如 `stop`）
+- 若开启 `stream_options.include_usage`，在 `[DONE]` 之前额外返回一帧 `choices: []` 的用量事件
+- 正常结束发送 `data: [DONE]`；**中途出错则发送 SSE 错误事件并终止，不再发送 `[DONE]`**
 
 **错误响应**（统一结构 `{"error":{"message","type","param","code"}}`）
 
@@ -266,9 +292,10 @@ Consul 中会出现两个 `chat_service` 实例，gateway 会在它们之间分�
 | `500` | 服务端 ResponseWriter 不支持 Flush | `stream_unsupported` |
 | `502` | 下游模型返回异常响应，或流式请求无法建立 | `upstream_error` |
 | `503` | 模型服务不可用或熔断已打开 | `service_unavailable` |
-| `504` | 模型调用超时（非流式，网关侧上限 15s） | `timeout` |
+| `504` | 模型调用超时（非流式，处理时限 70s） | `timeout` |
 
-> 流式请求一旦开始返回 `200`，就无法再改写 HTTP 状态码，后续错误只能通过 SSE error 事件表达。
+> 流式请求一旦开始返回 `200`，就无法再改写 HTTP 状态码，后续错误只能通过 SSE 错误事件表达，
+> 其 `code` 取值与上表一致（`timeout` / `service_unavailable` / `upstream_error`）。
 
 ---
 
@@ -284,29 +311,32 @@ Consul 中会出现两个 `chat_service` 实例，gateway 会在它们之间分�
 - [x] 客户端熔断与退避重试
 - [x] 跨进程 metadata 与 `request_id` 透传
 - [x] **接入通义千问真实模型**，替换模拟回复
-- [x] **非流式 token 用量取自模型返回的真实统计**
+- [x] **token 用量取自模型返回的真实统计**：非流式直接返回，流式经 `include_usage`
 - [x] 模型能力抽象为 `biz.ModelProvider` 接口，业务层与厂商解耦
-- [x] **SSE 流式回答**：新增 `StreamChatCompletion` 服务端流式 RPC 与 OpenAI 兼容 `text/event-stream` 输出
+- [x] **SSE 流式回答**：`StreamChatCompletion` 服务端流式 RPC + OpenAI 兼容 `text/event-stream`
+- [x] **流式 token 用量透出**：支持 `stream_options.include_usage`，按需下发用量帧
+- [x] **超时链路重构**：非流式 / 流式分别设定，内层短于外层
+- [x] **流式中途错误细分**：区分超时、下游不可用与一般中断
+- [x] **端到端集成测试**：覆盖超过旧传输层限制（1s / 2s）的慢响应
 
 **待办**
 
-- [ ] 流式响应的 token 用量透出（上游已开启 `include_usage`，尚未传到客户端）
 - [ ] 多模型路由：按请求参数分发到不同厂商 / 模型，取代当前写死的 `chat-default` 判断
 - [ ] 模型调用重试与降级策略（当前仅 gRPC 层有重试）
 - [ ] Agent 编排能力
 - [ ] 数据库 / Redis 实际接入，配置外部化
-- [ ] 单元测试与 CI
+- [ ] CI 接入（当前测试需手动执行）
 
 ---
 
 ## 已知限制
 
-- **流式响应不返回 `usage`**。Provider 已向上游请求 `stream_options.include_usage`，但 token 统计在 `data` 层解析后未继续向上传递，流式调用暂时拿不到用量。
 - **逻辑模型名只有 `chat-default` 一个**，传入其他值会被 Provider 拒绝。
 - 不支持的模型名目前经过 gateway 的错误映射后返回 **`502 upstream_error`**，语义上更接近客户端参数错误（`400`），后续统一错误分类时修正。
 - 响应 `model` 字段回显请求值，未透出上游真实模型名。
-- 超时值分散在三处且不一致：非流式 15s、流式 60s、Provider HTTP 客户端 60s，尚未收敛到配置。
-- 流式错误日志中的 `request_id` 可能为空（取值上下文与 metadata 注入路径尚未对齐）。
+- 流式的 `include_usage` 只控制是否下发用量帧；Provider 对上游始终请求用量。
+- `configs-instance-2/config.yaml` 的 `server.grpc.timeout` 仍为 `1s`，第二实例跑慢请求会被截断，需与主实例对齐。
+- 流式中途出错后不再写日志，`requestID` 辅助函数当前未被调用。
 
 ---
 
@@ -320,6 +350,7 @@ Consul 中会出现两个 `chat_service` 实例，gateway 会在它们之间分�
 | `make generate` | `go generate` + `go mod tidy` |
 | `make build` | 编译到 `bin/` |
 | `make all` | 依次执行以上生成流程 |
+| `go test ./...` | 运行测试 |
 
 ---
 

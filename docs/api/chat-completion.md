@@ -1,6 +1,6 @@
 # Chat Completions API 对接文档
 
-**版本：** v0.3
+**版本：** v0.4
 
 **状态：** 已实现（非流式 + SSE 流式），已接入通义千问真实模型
 
@@ -20,8 +20,8 @@
 
 | `stream` | 响应类型 | 说明 |
 | --- | --- | --- |
-| `false`（默认） | `application/json` | 一次性返回完整结果，网关侧时限 15s |
-| `true` | `text/event-stream` | 按块推送增量内容，以 `data: [DONE]` 结束，网关侧时限 60s |
+| `false`（默认） | `application/json` | 一次性返回完整结果，处理时限 70s |
+| `true` | `text/event-stream` | 按块推送增量内容，以 `data: [DONE]` 结束，处理时限 300s |
 
 > **参数校验先于流式响应。** 请求体非法、`model` 缺失、`messages` 为空、角色不支持等错误，
 > 即使 `stream=true` 也会以普通 JSON 返回 `4xx`，不会先返回 `200` 再报错。
@@ -36,6 +36,8 @@
 | `messages[].role` | string | 是 | 消息角色，支持 `system`、`user`、`assistant` |
 | `messages[].content` | string | 是 | 消息正文，不可为空或纯空白 |
 | `stream` | boolean | 否 | 是否使用流式响应，默认 `false` |
+| `stream_options` | object | 否 | 流式选项，仅 `stream=true` 时生效，详见 2.2 |
+| `stream_options.include_usage` | boolean | 否 | 是否在流结束前下发 token 用量帧，默认 `false` |
 
 当前只支持文本消息。
 
@@ -44,15 +46,27 @@
 `model` 是**逻辑模型名**，不是厂商真实模型名。当前只接受 `chat-default`，由服务端环境变量
 `QWEN_MODEL`（默认 `qwen-plus`）决定背后实际调用的模型。
 
-这样设计是为了后续实现多模型路由时，对外契约保持不变。传入其他值会被拒绝。
+这样设计是为了后续实现模型路由时，对外契约保持不变。传入其他值会被拒绝。
+
+### 2.2 stream_options 说明
+
+`stream_options.include_usage` 控制是否在流结束前额外下发一帧用量事件：
+
+- 取值 `false` 或省略（默认）：整个流不出现 `usage` 字段。
+- 取值 `true`：在终止帧之后、`data: [DONE]` 之前，额外发送一帧 `choices: []` 且带 `usage` 的事件。
+- 该选项在 `stream=false` 时被忽略，非流式响应始终包含 `usage`。
 
 **非流式请求示例：**
 
 `{"model":"chat-default","messages":[{"role":"user","content":"你好，请介绍一下 Go"}],"stream":false}`
 
-**流式请求示例：**
+**流式请求示例（不含用量）：**
 
 `{"model":"chat-default","messages":[{"role":"user","content":"你好，请介绍一下 Go"}],"stream":true}`
+
+**流式请求示例（含用量）：**
+
+`{"model":"chat-default","messages":[{"role":"user","content":"你好，请介绍一下 Go"}],"stream":true,"stream_options":{"include_usage":true}}`
 
 ## 3. 非流式成功响应
 
@@ -99,16 +113,19 @@ HTTP 状态码：`200 OK`
 | `object` | string | 固定为 `chat.completion.chunk` |
 | `created` | integer | 创建时间，Unix 时间戳，单位为秒，同一流内一致 |
 | `model` | string | 回显请求中的逻辑模型名 |
-| `choices` | array | 长度恒为 `1` |
+| `choices` | array | 内容帧长度恒为 `1`；用量帧为**空数组** |
 | `choices[].index` | integer | 固定为 `0` |
 | `choices[].delta.role` | string | 仅首帧出现，值为 `assistant` |
 | `choices[].delta.content` | string | 增量文本，可能为空（此时字段省略） |
 | `choices[].finish_reason` | string \| null | 未结束时为 `null`，终止帧为 `stop` 等 |
+| `usage` | object | 仅用量帧出现，结构同非流式的 `usage` |
 
 > `id` 由网关生成（形如 `chatcmpl-<UnixNano>`），与上游模型返回的 ID 无关。
 > 这一点与非流式响应不同——后者直接透传模型返回的 ID。
 
 ### 4.2 完整示例
+
+开启 `stream_options.include_usage` 时：
 
 ```
 data: {"id":"chatcmpl-1730000000000000000","object":"chat.completion.chunk","created":1730000000,"model":"chat-default","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}
@@ -119,23 +136,30 @@ data: {"id":"chatcmpl-1730000000000000000","object":"chat.completion.chunk","cre
 
 data: {"id":"chatcmpl-1730000000000000000","object":"chat.completion.chunk","created":1730000000,"model":"chat-default","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
 
+data: {"id":"chatcmpl-1730000000000000000","object":"chat.completion.chunk","created":1730000000,"model":"chat-default","choices":[],"usage":{"prompt_tokens":18,"completion_tokens":26,"total_tokens":44}}
+
 data: [DONE]
 ```
+
+未开启时，倒数第二行（用量帧）不会出现。
 
 ### 4.3 流式协议约定
 
 1. 建立连接后**先发送一帧只含 `delta.role` 的事件**，客户端据此可确认流已开始。
 2. 之后逐帧推送 `delta.content`，内容需要在客户端**按序拼接**。
 3. 终止帧的 `finish_reason` 非 `null`，此时 `delta` 可能为空对象。
-4. 以 `data: [DONE]` 表示正常结束，客户端收到后应停止读取。
-5. 空行、注释行以及非 `data:` 开头的行都应被忽略。
+4. 若请求了 `include_usage`，终止帧之后会有一帧 `choices: []` 的用量事件。
+5. 正常结束时发送 `data: [DONE]`，客户端收到后应停止读取。
+6. **流中途出错时只发送一帧错误事件然后终止，不会再发送 `[DONE]`**（详见 5.3）。
+7. 空行、注释行以及非 `data:` 开头的行都应被忽略。
 
 ### 4.4 流式响应中的 token 用量
 
-**当前版本流式响应不返回 `usage`。** 上游已开启 `stream_options.include_usage`，
-但 token 统计在数据层解析后未继续向上传递，因此流式调用暂时拿不到用量。
-
-需要精确计费时，请先使用非流式接口，或等待后续版本补齐。
+- `stream_options.include_usage` 为 `true` 时，流结束前返回一帧 `choices: []`、带 `usage` 的事件。
+- 该帧的 `usage` 字段结构与非流式响应完全一致，可直接用于计费核算。
+- 该帧在终止帧之后、`[DONE]` 之前到达，客户端应在拼接正文时跳过 `choices` 为空的帧。
+- 未开启时不会出现用量帧，此时无法从流式响应中获得 token 用量。
+- 服务端对上游始终请求用量，`include_usage` 只控制是否下发给客户端。
 
 ## 5. 错误响应
 
@@ -173,37 +197,64 @@ data: [DONE]
 | `500` | `server_error` | `stream_unsupported` | （空） | 服务端 ResponseWriter 不支持 Flush |
 | `502` | `server_error` | `upstream_error` | （空） | 下游模型返回异常响应，或流式请求无法建立 |
 | `503` | `server_error` | `service_unavailable` | （空） | 下游不可用，或熔断器已打开 |
-| `504` | `server_error` | `timeout` | （空） | 下游调用超时（非流式，网关侧上限 15s） |
+| `504` | `server_error` | `timeout` | （空） | 下游调用超时（非流式，处理时限 70s） |
 
 > 注意：传入不支持的 `model` 目前会被归入 `502 upstream_error`，语义上更接近客户端参数错误。
 > 待统一错误分类后修正为 `400`。
 
 ### 5.3 流式响应中途的错误
 
-一旦响应头以 `200` 发出，HTTP 状态码就无法再更改。此时链路错误通过一条 SSE 事件表达：
+一旦响应头以 `200` 发出，HTTP 状态码就无法再更改。此时链路错误通过一条 SSE 事件表达，
+其结构与非流式错误一致，随后连接结束：
+
+| `code` | `message` | 触发场景 |
+| --- | --- | --- |
+| `timeout` | `chat stream timed out` | 流已开始后，处理时限（300s）或模型调用时限（270s）耗尽 |
+| `service_unavailable` | `chat service temporarily unavailable` | 下游不可用，或熔断器已打开 |
+| `upstream_error` | `chat stream interrupted` | 其他下游异常或链路中断 |
+
+示例：
 
 ```
-data: {"error":{"message":"chat stream interrupted","type":"server_error","param":"","code":"stream_interrupted"}}
+data: {"error":{"message":"chat stream timed out","type":"server_error","param":"","code":"timeout"}}
 ```
 
-| `code` | 触发场景 |
-| --- | --- |
-| `stream_interrupted` | 流已开始后，下游模型异常、超时（60s）或链路中断 |
+几条约定：
 
-客户端处理建议：收到该事件后应视为本次生成失败，**不要**把已拼接的内容当作完整答案。
+1. 发出错误事件后**立即终止，不再发送 `[DONE]`**。
+2. 若错误源于**调用方主动断开连接**，服务端不会再向已断开的连接写入任何内容。
+3. 客户端收到错误事件后应视为本次生成失败，**不要**把已拼接的内容当作完整答案。
+4. 由于错误码与非流式一致，客户端可以复用同一套错误处理逻辑。
 
 ### 5.4 调用方建议
 
 - `400`：请求本身有问题，重试无意义，应修正参数。
 - `500` / `502` / `503` / `504`：属于下游或链路问题，可配合退避策略重试。
 - 熔断已打开时（`503` + `service_unavailable`），网关内部的 gRPC 重试会主动跳过，避免放大故障。
-- 流式请求建议设置客户端读超时略大于 60s，避免网关侧超时后客户端仍在等待。
+- 流式请求建议客户端读超时设置**大于 300s**，否则会在网关返回超时前先行断开。
 
-## 6. 暂不支持的功能
+## 6. 超时
 
-工具调用、多模态输入、多个候选结果、自定义采样参数（`temperature`、`top_p` 等）、流式响应的 token 用量透出，暂不支持，后续按项目计划逐步增加。
+服务端按「内层短、外层长」逐层设置，避免外层先超时而后内层仍在消耗模型配额。
 
-## 7. 验收标准
+| 层级 | 非流式 | 流式 |
+| --- | --- | --- |
+| Provider HTTP 调用 | 60s | 270s |
+| gRPC Server（chat_service） | 65s | 不生效 |
+| gRPC Client（gateway） | 70s | 不生效 |
+| Gateway 请求处理 | 70s | 300s |
+
+说明：
+
+- Kratos 的 gRPC `timeout` 选项**只作用于一元调用**，流式调用由请求上下文控制，因此流式那一列为「不生效」。
+- 超时在非流式下表现为 HTTP `504` + `timeout`；在流式下表现为 SSE `timeout` 事件。
+- 网关 HTTP Server 层的默认 1s 超时已关闭，不会干扰上述设定。
+
+## 7. 暂不支持的功能
+
+工具调用、多模态输入、多个候选结果、自定义采样参数（`temperature`、`top_p` 等），暂不支持，后续按项目计划逐步增加。
+
+## 8. 验收标准
 
 | # | 标准 | 状态 |
 | - | ---- | ---- |
@@ -215,12 +266,13 @@ data: {"error":{"message":"chat stream interrupted","type":"server_error","param
 | 6 | HTTP 层不直接依赖具体模型厂商的 SDK | 已达成（厂商细节封装在 `internal/data`） |
 | 7 | 能对接真实模型并返回真实 token 用量（非流式） | 已达成（通义千问） |
 | 8 | 能以 SSE 流式返回增量内容，并以 `[DONE]` 结束 | 已达成 |
-| 9 | 流式响应能透出 token 用量 | 未达成，见 4.4 |
+| 9 | 流式响应能透出 token 用量 | 已达成（`stream_options.include_usage`） |
+| 10 | 慢于旧传输层限制（1s / 2s）的请求不被截断 | 已达成，并有端到端集成测试覆盖 |
 
-## 8. 已知限制
+## 9. 已知限制
 
-- 流式响应不返回 `usage`，无法用于精确计费（见 4.4）。
 - 逻辑模型名只有 `chat-default` 一个，传入其他值会被拒绝。
 - 不支持的模型名返回 `502 upstream_error` 而非 `400`，错误分类待统一。
 - 响应 `model` 字段回显请求值，未透出上游真实模型名。
-- 超时值分散且不一致：非流式 15s、流式 60s、Provider HTTP 客户端 60s。
+- 流式中途出错后不再记录服务端日志，排查生产问题时只能依赖客户端上报的错误事件。
+- `configs-instance-2/config.yaml` 的 gRPC 超时仍为 `1s`，第二实例跑慢请求会被截断。

@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"time"
 
 	chatv1 "chat_service/api/chat/v1"
 
@@ -17,6 +18,8 @@ func NewChatClient(discovery kregistry.Discovery) (chatv1.ChatClient, func(), er
 		context.Background(),
 		kgrpc.WithEndpoint("discovery:///chat_service"),
 		kgrpc.WithDiscovery(discovery),
+		// 覆盖默认的 2 秒 unary 超时；调用方更短的期限仍然有效。
+		kgrpc.WithTimeout(70*time.Second),
 		kgrpc.WithMiddleware(
 			metamw.Client(),
 			circuitbreaker.Client(),

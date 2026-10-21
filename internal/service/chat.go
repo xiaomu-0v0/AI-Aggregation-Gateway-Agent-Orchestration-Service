@@ -77,12 +77,27 @@ func (s *ChatService) StreamChatCompletion(in *chatv1.CreateChatCompletionReques
 		in.GetModel(),
 		messages,
 		func(chunk *biz.ModelStreamChunk) error {
-			return stream.Send(&chatv1.ChatCompletionChunk{
+			// 只有客户端请求 include_usage 时才转发用量事件。
+			if chunk.Usage != nil && !in.GetIncludeUsage() {
+				return nil
+			}
+
+			out := &chatv1.ChatCompletionChunk{
 				Id:           chunk.ID,
 				Model:        chunk.Model,
 				Content:      chunk.Content,
 				FinishReason: chunk.FinishReason,
-			})
+			}
+
+			if chunk.Usage != nil {
+				out.Usage = &chatv1.ChatCompletionUsage{
+					PromptTokens:     chunk.Usage.PromptTokens,
+					CompletionTokens: chunk.Usage.CompletionTokens,
+					TotalTokens:      chunk.Usage.TotalTokens,
+				}
+			}
+
+			return stream.Send(out)
 		},
 	)
 }
